@@ -1,0 +1,92 @@
+name: Deploy por entorno
+
+# Se dispara cuando haces push a cualquiera de estas ramas
+on:
+  push:
+    branches:
+      - dev1
+      - dev2
+      - qa
+      - main   # usamos main como producción (prod)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Deploy por SSH al servidor
+        uses: appleboy/ssh-action@v0.1.8
+        with:
+          host: ${{ secrets.SERVER_HOST }}        # IP o host de tu servidor
+          username: ${{ secrets.SERVER_USER }}    # usuario SSH (ej. ubuntu)
+          key: ${{ secrets.SERVER_SSH_KEY }}      # clave privada SSH (sin passphrase o con agente)
+          port: ${{ secrets.SERVER_SSH_PORT }}    # opcional, default 22
+          script: |
+            set -e
+
+            # --- mapping branch -> entorno ---
+            BRANCH="${GITHUB_REF##*/}"
+            if [ "$BRANCH" = "main" ]; then
+              ENV="prod"
+            else
+              ENV="$BRANCH"
+            fi
+
+            BASE_PATH="${{ secrets.SERVER_BASE_PATH }}" # ej: /var/www
+            TARGET_DIR="${BASE_PATH}/${ENV}/laravel-app"
+
+            echo "Deployando rama '$BRANCH' al entorno '$ENV' en $TARGET_DIR"
+
+            # Asegurar directorios
+            mkdir -p "${TARGET_DIR}"
+
+            # Si no existe repo, clonamos; si existe hacemos pull
+            if [ ! -d "${TARGET_DIR}/.git" ]; then
+              echo "Clonando repo en ${TARGET_DIR}..."
+              git clone --branch ${BRANCH} ${GITHUB_SERVER_URL}/${{ github.repository }} "${TARGET_DIR}"
+            else
+              echo "Actualizando repo en ${TARGET_DIR}..."
+              cd "${TARGET_DIR}"
+              git fetch --all
+              git reset --hard origin/${BRANCH}
+            fi
+
+            cd "${TARGET_DIR}"
+
+            # Instalar composer si es requerido (asumimos composer disponible en servidor)
+            if command -v composer > /dev/null 2>&1; then
+              composer install --no-interaction --no-dev --optimize-autoloader
+            else
+              echo "Composer no está instalado en el servidor; omitiendo composer install."
+            fi
+
+            # Crear .env si no existe y generar key
+            if [ ! -f ".env" ]; then
+              if [ -f ".env.example" ]; then
+                cp .env.example .env
+                if command -v php > /dev/null 2>&1; then
+                  php artisan key:generate --force
+                fi
+              fi
+            fi
+
+            # Permisos básicos
+            if command -v chown > /dev/null 2>&1; then
+              # Ajusta usuario:grupo según tu configuración (ej: www-data:www-data)
+              chown -R ${{ secrets.SERVER_USER }}:$({{ secrets.SERVER_USER }} 2>/dev/null || echo ${{ secrets.SERVER_USER }}) "${TARGET_DIR}" || true
+            fi
+
+            # Reiniciar contenedores Docker para que monten el nuevo código
+            # Formato de contenedores en tu Terraform: "<env>_app", "<env>_nginx", etc.
+            echo "Reiniciando contenedores Docker del entorno ${ENV}..."
+            docker restart "${ENV}_app" || true
+            docker restart "${ENV}_nginx" || true
+
+            # Si quieres reiniciar todo el stack:
+            # docker restart "${ENV}_postgres" || true
+            # docker restart "${ENV}_redis" || true
+
+            echo "Deploy finalizado para ${ENV}."
